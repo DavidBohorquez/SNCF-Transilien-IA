@@ -11,6 +11,7 @@
 !*.jpeg
 !*.gif
 !*.webp
+!README.md
 
 # Retain .gitignore itself
 !.gitignore
