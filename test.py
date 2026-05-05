@@ -9,6 +9,8 @@ from sklearn.model_selection import train_test_split, KFold, GroupKFold
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_selection import mutual_info_regression
+from scipy.optimize import minimize_scalar
 
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 import tensorflow as tf
@@ -77,7 +79,6 @@ if 'date' in clean_train_df.columns:
     clean_train_df['date'] = pd.to_datetime(clean_train_df['date'], errors='coerce')
     clean_train_df['day_of_week'] = clean_train_df['date'].dt.dayofweek
     clean_train_df['day_of_year'] = clean_train_df['date'].dt.dayofyear
-    clean_train_df['is_weekend'] = clean_train_df['day_of_week'].isin([5, 6]).astype(int)
 
 # --- Plots & EDA ---
 def plot_comprehensive_eda(df):
@@ -376,7 +377,7 @@ FEATURE_FLAGS = {
     'trip_stats': False,  # DISABLED: same leakage pattern (trip mean ≈ target proxy on partial test trips)
     'cyclical':   True,   # sin/cos of day_of_week and day_of_year; month
 }
-PRINT_IMPORTANCE = False  # set True once to audit feature importances (slow: ~2 min)
+# Feature importance audit runs unconditionally before training (see audit_feature_importance below)
 
 # --- 3. Feature Engineering ---
 if 'date' in clean_train_df.columns:
@@ -384,7 +385,8 @@ if 'date' in clean_train_df.columns:
     clean_train_df['day_of_week'] = clean_train_df['date'].dt.dayofweek
     clean_train_df['day_of_year'] = clean_train_df['date'].dt.dayofyear
     clean_train_df['month']       = clean_train_df['date'].dt.month
-    clean_train_df['is_weekend']  = clean_train_df['day_of_week'].isin([5, 6]).astype(int)
+    print(f"\n[data audit] day_of_week present in dataset:")
+    print(clean_train_df['day_of_week'].value_counts().sort_index().to_string())
 
 if FEATURE_FLAGS['cyclical'] and 'day_of_week' in clean_train_df.columns:
     clean_train_df['dow_sin'] = np.sin(2 * np.pi * clean_train_df['day_of_week'] / 7)
@@ -468,6 +470,39 @@ if 'gare' in clean_train_df.columns and 'p0q0' in clean_train_df.columns:
     clean_train_df = clean_train_df.drop(columns=['gare'])
 else:
     N_GARE = 0
+
+# LOO target encoding for train number: each scheduled service has a characteristic delay profile.
+# Train numbers are recurring (same service ID runs on multiple dates), so the encoding is
+# informative even on a temporal split. Unseen numbers fall back to global mean via smoothing.
+if 'train' in clean_train_df.columns and 'p0q0' in clean_train_df.columns:
+    _alpha_t      = 1.0
+    _train_mask_t = clean_train_df['source'] == 'train'
+    _tr_t         = clean_train_df[_train_mask_t]
+    _global_mean_t = float(_tr_t['p0q0'].mean())
+    _train_stats  = _tr_t.groupby('train')['p0q0'].agg(['sum', 'count'])
+    _enc_t        = np.full(len(clean_train_df), _global_mean_t, dtype=np.float32)
+    _tr_pos_t     = np.where(_train_mask_t.values)[0]
+    _groups_t     = _tr_t[['train', 'date']].astype(str).agg('|'.join, axis=1).values
+    _gkf_t        = GroupKFold(n_splits=5)
+    for _, (fold_tr, fold_va) in enumerate(
+            _gkf_t.split(_tr_t, _tr_t['p0q0'].values, _groups_t)):
+        _fs_t = _tr_t.iloc[fold_tr].groupby('train')['p0q0'].agg(['sum', 'count'])
+        _enc_map_t = {k: ((_fs_t.loc[k, 'sum'] + _alpha_t * _global_mean_t) /
+                          (_fs_t.loc[k, 'count'] + _alpha_t)) if k in _fs_t.index
+                      else _global_mean_t
+                      for k in clean_train_df['train'].unique()}
+        _enc_t[_tr_pos_t[fold_va]] = (
+            _tr_t.iloc[fold_va]['train'].map(_enc_map_t).fillna(_global_mean_t).values.astype(np.float32)
+        )
+    _test_mask_t = ~_train_mask_t
+    _test_enc_map_t = {k: ((_train_stats.loc[k, 'sum'] + _alpha_t * _global_mean_t) /
+                            (_train_stats.loc[k, 'count'] + _alpha_t)) if k in _train_stats.index
+                       else _global_mean_t
+                       for k in clean_train_df['train'].unique()}
+    _enc_t[_test_mask_t.values] = (
+        clean_train_df[_test_mask_t]['train'].map(_test_enc_map_t).fillna(_global_mean_t).values.astype(np.float32)
+    )
+    clean_train_df['train_delay_enc'] = _enc_t
 
 # --- 4. Model Definitions ---
 def train_rf_best_params(df, features, target, test_size=0.2, random_state=42):
@@ -566,7 +601,7 @@ NN_SCALE_COLS = [
     'arret', 'day_of_year', 'month',
     'p2q0', 'p3q0', 'p4q0', 'p0q2', 'p0q3', 'p0q4',
     'gare_in_count', 'gare_out_count', 'gare_in_mean_delay', 'gare_out_mean_delay',
-    'gare_delay_enc',
+    'gare_delay_enc', 'train_delay_enc',
     *[f'flowavg{d}' for d in range(1, 9)],
     'dow_sin', 'dow_cos', 'doy_sin', 'doy_cos',
 ]
@@ -756,13 +791,13 @@ def train_nn_full_predict(train_df, test_df, features, target, scale_cols=NN_SCA
 _LGBM_PARAMS = {
     'objective':         'regression_l1',
     'metric':            'mae',
-    'num_leaves':        255,        # was 127 — more expressive trees
-    'learning_rate':     0.02,       # was 0.05 — slower but better generalisation
-    'min_child_samples': 10,         # was 20
+    'num_leaves':        127,        # was 255 — fewer leaves reduce overfit to training gare/arret patterns
+    'learning_rate':     0.02,
+    'min_child_samples': 40,         # was 10 — require 4× more data per leaf
     'subsample':         0.85,
     'colsample_bytree':  0.85,
     'reg_alpha':         0.1,
-    'reg_lambda':        1.0,
+    'reg_lambda':        3.0,        # was 1.0 — stronger L2
     'verbose':           -1,
 }
 
@@ -887,6 +922,44 @@ def train_rf_time_holdout(df, features, target, date_col='date', quantile=0.85,
     print(f"[time holdout] MAE: {mae:.4f} minutes | R2: {r2:.4f}")
     return {'mae': mae, 'r2': r2, 'cutoff': cutoff}
 
+def audit_feature_importance(df, features, target='p0q0', sample_frac=0.30, seed=42):
+    """Two-method feature importance audit on a sample.
+
+    Method 1: LGBM gain + split (matches the production model).
+    Method 2: mutual_info_regression (non-parametric, captures non-linear signal).
+    Verdict: 'DEAD' if both LGBM gain == 0 AND mutual_info < 1e-4 — flagged for manual removal.
+    """
+    print(f"\n--- Feature importance audit ({int(sample_frac*100)}% sample, n_features={len(features)}) ---")
+    sample = df.sample(frac=sample_frac, random_state=seed)
+    X = sample[features].fillna(0).values.astype(np.float32)
+    y = sample[target].values.astype(np.float32)
+
+    lgbm_audit = lgb.train(
+        {'objective': 'regression_l1', 'metric': 'mae', 'verbose': -1,
+         'num_leaves': 63, 'learning_rate': 0.05, 'random_state': seed},
+        lgb.Dataset(X, label=y),
+        num_boost_round=200,
+    )
+    gain  = lgbm_audit.feature_importance(importance_type='gain')
+    split = lgbm_audit.feature_importance(importance_type='split')
+
+    mi = mutual_info_regression(X, y, random_state=seed)
+
+    rows = []
+    for i, f in enumerate(features):
+        verdict = 'DEAD' if (gain[i] == 0.0 and mi[i] < 1e-4) else 'KEEP'
+        rows.append((f, float(gain[i]), int(split[i]), float(mi[i]), verdict))
+    rows.sort(key=lambda r: -r[1])
+
+    print(f"  {'feature':<22}{'lgbm_gain':>12}{'lgbm_split':>12}{'mutual_info':>14}   verdict")
+    for f, g, s, m, v in rows:
+        print(f"  {f:<22}{g:>12.2f}{s:>12d}{m:>14.4f}   {v}")
+    dead = [r[0] for r in rows if r[4] == 'DEAD']
+    if dead:
+        print(f"  → {len(dead)} DEAD features flagged: {dead}")
+    return rows
+
+
 # --- 5. Execution & Submission ---
 X_train_df = clean_train_df[clean_train_df['source'] == 'train'].copy()
 X_test_df  = clean_train_df[clean_train_df['source'] == 'test'].copy()
@@ -907,21 +980,13 @@ n_flow = sum(c.startswith('flowavg') for c in features)
 print(f"\nFeatures: {len(features)} total | flow={n_flow} gare_ohe={len(_gare_ohe_cols)} "
       f"nn_features={len(nn_features)} N_GARE={N_GARE}")
 
-if PRINT_IMPORTANCE:
-    print("\n--- Feature importance (quick RF on 30% sample) ---")
-    sample = X_train_df.sample(frac=0.30, random_state=42)
-    _rf_imp = RandomForestRegressor(n_estimators=50, max_depth=15, n_jobs=-1, random_state=42)
-    _rf_imp.fit(sample[features].fillna(0), sample['p0q0'])
-    imp = sorted(zip(features, _rf_imp.feature_importances_), key=lambda x: -x[1])
-    for fname, score in imp[:30]:
-        print(f"  {score:.4f}  {fname}")
+audit_feature_importance(X_train_df, features, target='p0q0', sample_frac=0.30)
 
 # 3-model ensemble: LGBM + CatBoost + NN (gare Embedding)
 # LGBM/CatBoost: gare_delay_enc (LOO) + gare_cat (CatBoost treats as categorical) + graph + numeric
 # NN: gare_delay_enc + graph + numeric (no OHE), gare_cat goes to learned Embedding separately
-LGBM_WEIGHT     = 0.65
-CATBOOST_WEIGHT = 0.25
-NN_WEIGHT       = 0.10
+# LGBM and CB weights are set analytically via OOF optimisation (see below); NN weight is fixed.
+NN_WEIGHT = 0.10  # fixed: NN has only 10% val coverage, excluded from OOF optimisation
 
 print('\n--- [LGBM] GroupKFold OOF (5 folds) + bagged test predictions ---')
 lgbm_oof, lgbm_test_preds, lgbm_oof_mae = train_lgbm_oof_predict(
@@ -933,6 +998,20 @@ catboost_oof, catboost_test_preds, catboost_oof_mae = train_catboost_oof_predict
     X_train_df, X_test_df, features, target='p0q0')
 print(f"  CatBoost OOF MAE: {catboost_oof_mae:.4f}")
 
+# Analytical optimisation: find the LGBM/(LGBM+CB) split that minimises OOF MAE.
+# Both models have full 667k-row OOF coverage so this is unbiased.
+_y_oof = X_train_df['p0q0'].values.astype(np.float32)
+_opt = minimize_scalar(
+    lambda w: mean_absolute_error(_y_oof, w * lgbm_oof + (1 - w) * catboost_oof),
+    bounds=(0.0, 1.0), method='bounded',
+)
+_w_lgbm     = float(_opt.x)
+LGBM_WEIGHT     = _w_lgbm * (1 - NN_WEIGHT)
+CATBOOST_WEIGHT = (1 - _w_lgbm) * (1 - NN_WEIGHT)
+print(f"\n  OOF optimal LGBM/(LGBM+CB): {_w_lgbm:.4f} "
+      f"→ LGBM={LGBM_WEIGHT:.3f} CB={CATBOOST_WEIGHT:.3f} NN={NN_WEIGHT:.3f} "
+      f"(OOF blend MAE={_opt.fun:.4f})")
+
 print('\n--- [NN] Training on numeric features + gare Embedding ---')
 nn_test_preds, nn_val_mae = train_nn_full_predict(
     X_train_df, X_test_df, nn_features, target='p0q0',
@@ -942,7 +1021,7 @@ print(f"  NN val MAE: {nn_val_mae:.4f}")
 test_predictions = (LGBM_WEIGHT     * lgbm_test_preds
                     + CATBOOST_WEIGHT * catboost_test_preds
                     + NN_WEIGHT       * nn_test_preds)
-print(f"\n  Ensemble (LGBM×{LGBM_WEIGHT} + CB×{CATBOOST_WEIGHT} + NN×{NN_WEIGHT}): "
+print(f"\n  Ensemble (LGBM×{LGBM_WEIGHT:.3f} + CB×{CATBOOST_WEIGHT:.3f} + NN×{NN_WEIGHT:.3f}): "
       f"LGBM={lgbm_oof_mae:.4f} | CB={catboost_oof_mae:.4f} | NN={nn_val_mae:.4f}")
 
 submission_df = pd.DataFrame({
