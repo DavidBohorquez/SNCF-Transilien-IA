@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_context-mode_context-mode__ctx_execute",
+      "mcp__plugin_context-mode_context-mode__ctx_doctor",
+      "mcp__plugin_context-mode_context-mode__ctx_stats",
+      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      "Bash(rtk ls *)",
+      "mcp__plugin_context-mode_context-mode__ctx_execute_file",
+      "Bash(rtk read *)",
+      "Bash(rtk ps *)",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\David BOHORQUEZ\\\\Documents\\\\ynov_m1\\\\Machine_Learning\" -File | Where-Object { $_.Extension -in '.csv', '.png' } | Select-Object Name | Format-Table -AutoSize)"
+    ]
+  }
+}
