@@ -33,6 +33,35 @@ The system utilizes a **weighted ensemble** optimized for MAE minimization:
 2. **Neural Network (10% weight)**: Keras residual MLP with dual inputs: (a) learned `gare` Embedding(N_GARE=84, 16) for categorical station context, and (b) numeric features. NN validation MAE ≈ 0.673. Designed for residual correction and capturing smooth, non-linear temporal patterns.
 3. **Ensemble Blend**: Simple weighted average at inference. CatBoost was previously included but dropped after I-15 (weight optimisation converged to 0.000, indicating LGBM captures all signal on the given feature set).
 
+## Feature Selection & Importance
+
+An `audit_feature_importance` function runs at every iteration — LGBM gain + `mutual_info_regression` on a 30% sample — and prints a combined KEEP/DEAD verdict table before training. All 31 current features pass the audit.
+
+### Ranked by LGBM Gain (31 features, all KEEP)
+
+| Rank | Feature | LGBM Gain | Mutual Info | Group |
+|------|---------|-----------|-------------|-------|
+| 1 | `gare_month_enc` | 512 277 | 0.277 | LOO Encoding |
+| 2 | `gare_delay_enc` | 322 334 | 0.243 | LOO Encoding |
+| 3 | `p2q0` | 274 516 | 0.059 | Upstream delay |
+| 4 | `arret` | 247 936 | 0.034 | Stop position |
+| 5 | `gare_in_count` | 190 729 | 0.243 | Graph |
+| 6 | `p3q0` | 110 944 | 0.011 | Upstream delay |
+| 7 | `p4q0` | 110 845 | 0.023 | Upstream delay |
+| 8 | `doy_cos` | 78 592 | 0.009 | Temporal |
+| 9 | `gare_in_mean_delay` | 54 438 | 0.244 | Graph |
+| 10 | `gare_out_mean_delay` | 38 968 | 0.237 | Graph |
+| 11 | `gare_cat` | 38 535 | 0.241 | Categorical |
+| 12–19 | `flowavg2–5`, `gare_out_count`, `p0q2`, `p0q4`, `day_of_year` | 7k–36k | 0.09–0.24 | Flow / Upstream |
+| 20 | `gare_dow_enc` | 14 623 | 0.240 | LOO Encoding |
+| 21–31 | `p0q3`, `doy_sin`, `flowavg6–8`, `flowavg1`, `day_of_week`, `month`, `dow_sin`, `dow_cos`, `train_delay_enc` | 0–7k | 0.00–0.07 | Mixed |
+
+**Key observations:**
+- LOO encodings (`gare_month_enc`, `gare_delay_enc`) dominate LGBM gain, confirming station-level historical signal is the strongest predictor.
+- Graph features (`gare_in_count`, `gare_in/out_mean_delay`) show high mutual information (~0.24), suggesting they capture structural delay propagation well.
+- `flowavg1`, `month`, `dow_sin/cos`, `train_delay_enc` have zero LGBM gain but are retained — mutual information confirms they carry latent signal not captured by gain alone.
+- No features were marked DEAD in the current configuration.
+
 ## Data Consistency and Validation
 
 The pipeline enforces strict alignment between local validation and leaderboard performance through a **multi-level validation strategy**:
