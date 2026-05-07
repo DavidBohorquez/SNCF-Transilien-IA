@@ -8,7 +8,7 @@ The challenge focuses on predicting the waiting time difference (**p0q0**) for a
 * **Negative values**: Indicate delays (longer waiting times than scheduled).
 * **Positive values**: Indicate arrivals ahead of schedule.
 
-**Current Performance (I-14→I-15)**: Website leaderboard MAE = **0.6724** (non-regression baseline). Local metrics via 5-fold GroupKFold and time-holdout validation confirm stability across train/test distributions.
+**Current Performance (I-19)**: Website leaderboard MAE = **0.6719** (achieved with `gare_dow_enc` LOO encoding). Local metrics via 5-fold GroupKFold and time-holdout validation confirm stability across train/test distributions.
 
 ## Technical Architecture
 
@@ -20,7 +20,11 @@ The current feature set consists of **111+ total variables** structured into spe
 * **Graph-based Features (88)**: Topological relationships and connectivity between stations (cycle-aware graph metrics).
 * **Categorical Encodings**:
   - **Gare (Station) Embedding**: Categorical station identifier (84 unique gares) encoded as learned Embedding(84, 16) in the NN (replaces one-hot encoding). LightGBM receives ordinal encoding.
-  - **Leave-One-Out (LOO) Target Encodings**: High-cardinality features capture historical signal without leakage. Currently active: `gare_delay_enc` (mean delay per station, grouped by 5-fold CV), `train_delay_enc` (mean delay per train number). Computed within GroupKFold to prevent train/test contamination.
+  - **Leave-One-Out (LOO) Target Encodings**: High-cardinality features capture historical signal without leakage. Currently active:
+    - `gare_delay_enc`: Mean delay per station, grouped by 5-fold CV
+    - `train_delay_enc`: Mean delay per train number
+    - `gare_dow_enc`: Mean delay per station-day-of-week pair (low-cardinality, 420 combinations; accepted in I-19)
+    - All computed within GroupKFold to prevent train/test contamination.
 * **Temporal & Contextual**: Day of week, time of day, and other cyclical features.
 
 ### Model Strategy
@@ -35,15 +39,16 @@ The pipeline enforces strict alignment between local validation and leaderboard 
 * **GroupKFold Cross-Validation**: 5-fold stratification by train/route groups ensures temporal and operational consistency. LGBM OOF MAE ≈ 0.640; reported as single source-of-truth for feature engineering decisions.
 * **Time-Holdout Validation**: Chronological split to detect covariate shift and verify that features generalize across unseen time periods.
 * **Distribution Audit**: Adversarial validation identifies features with significant train/test drift. Features flagged for removal if drift exceeds threshold (e.g., `is_weekend` was a constant — removed in I-14).
-* **Leaderboard Alignment**: Website MAE 0.6724 vs. local GroupKFold OOF 0.640 = 0.032 gap, indicating healthy generalization with no serious distribution mismatch.
+* **Leaderboard Alignment**: Website MAE 0.6719 vs. local GroupKFold OOF ~0.643 = 0.028 gap, indicating healthy generalization with no serious distribution mismatch.
 
 ## Recent Improvements (Iteration Log)
 
 See `SKILL.md` for detailed iteration history and ablation studies. Key recent wins:
 
-* **I-14 (2026-05-05)**: Removed `is_weekend` constant feature and audited feature importance. Achieved **0.6724 MAE** (baseline).
-* **I-15 (2026-05-05)**: Dropped CatBoost (zero weight in ensemble), added `arret_delay_enc` + `train_gare_enc` LOO encodings. Reverted LOO additions due to test-set cardinality mismatch; kept CatBoost off. Effective ensemble: **LGBM×0.90 + NN×0.10**.
-* **I-13 (2026-05-05)**: OOF weight optimisation via `scipy.optimize.minimize_scalar` revealed CatBoost contributes zero weight—LGBM dominates on this feature set. Introduced `train_delay_enc` LOO encoding.
+* **I-19 (2026-05-07) ★ CURRENT BEST**: Added `gare_dow_enc` — LOO encoding for (gare, day-of-week) pairs. Cardinality: 84×5=420 well-covered combinations. Website **0.6719** (improvement −0.0005 vs I-14 baseline 0.6724). ✅ ACCEPTED.
+* **I-20 (2026-05-07)**: Attempted `gare_month_enc + train_dow_enc`. Website **0.7108** — catastrophic regression. ❌ REJECTED. Confirmed: `train`-based LOO encodings fail due to structurally different train ID distribution in test set.
+* **I-14 (2026-05-05)**: Removed `is_weekend` constant feature and audited feature importance. Achieved **0.6724 MAE** (non-regression baseline).
+* **I-13 (2026-05-05)**: OOF weight optimisation via `scipy.optimize.minimize_scalar` revealed CatBoost weight=0.000. Introduced `train_delay_enc` LOO encoding. Effective ensemble: **LGBM×0.90 + NN×0.10**.
 
 ## Requirements
 
