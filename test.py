@@ -10,7 +10,6 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.feature_selection import mutual_info_regression
-from scipy.optimize import minimize_scalar
 
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 import tensorflow as tf
@@ -504,6 +503,66 @@ if 'train' in clean_train_df.columns and 'p0q0' in clean_train_df.columns:
     )
     clean_train_df['train_delay_enc'] = _enc_t
 
+# LOO target encoding for (gare_cat, day_of_week) pair.
+# Cardinality: 84×5=420 combinations (~1600 rows each) — stable, low sparsity risk.
+# Captures day-specific station delay patterns (e.g. Gare du Nord is worse on Fridays).
+if 'gare_cat' in clean_train_df.columns and 'day_of_week' in clean_train_df.columns and 'p0q0' in clean_train_df.columns:
+    _alpha_gd       = 1.0
+    _train_mask_gd  = clean_train_df['source'] == 'train'
+    _tr_gd          = clean_train_df[_train_mask_gd]
+    _global_mean_gd = float(_tr_gd['p0q0'].mean())
+    _gd_key_tr      = _tr_gd['gare_cat'].astype(str) + '_' + _tr_gd['day_of_week'].astype(str)
+    _gd_stats       = _tr_gd.assign(_gd_key=_gd_key_tr).groupby('_gd_key')['p0q0'].agg(['sum', 'count'])
+    _enc_gd         = np.full(len(clean_train_df), _global_mean_gd, dtype=np.float32)
+    _tr_pos_gd      = np.where(_train_mask_gd.values)[0]
+    _groups_gd      = _tr_gd[['train', 'date']].astype(str).agg('|'.join, axis=1).values
+    _gkf_gd         = GroupKFold(n_splits=5)
+    for _, (fold_tr, fold_va) in enumerate(
+            _gkf_gd.split(_tr_gd, _tr_gd['p0q0'].values, _groups_gd)):
+        _fold_keys = (_tr_gd.iloc[fold_tr]['gare_cat'].astype(str) + '_' +
+                      _tr_gd.iloc[fold_tr]['day_of_week'].astype(str))
+        _fs_gd = _tr_gd.iloc[fold_tr].assign(_gd_key=_fold_keys).groupby('_gd_key')['p0q0'].agg(['sum', 'count'])
+        _val_keys_gd = (_tr_gd.iloc[fold_va]['gare_cat'].astype(str) + '_' +
+                        _tr_gd.iloc[fold_va]['day_of_week'].astype(str))
+        _enc_gd[_tr_pos_gd[fold_va]] = _val_keys_gd.map(
+            lambda k: ((_fs_gd.loc[k, 'sum'] + _alpha_gd * _global_mean_gd) /
+                       (_fs_gd.loc[k, 'count'] + _alpha_gd)) if k in _fs_gd.index
+                      else _global_mean_gd
+        ).values.astype(np.float32)
+    _test_mask_gd = ~_train_mask_gd
+    _test_keys_gd = (clean_train_df[_test_mask_gd]['gare_cat'].astype(str) + '_' +
+                     clean_train_df[_test_mask_gd]['day_of_week'].astype(str))
+    _enc_gd[_test_mask_gd.values] = _test_keys_gd.map(
+        lambda k: ((_gd_stats.loc[k, 'sum'] + _alpha_gd * _global_mean_gd) /
+                   (_gd_stats.loc[k, 'count'] + _alpha_gd)) if k in _gd_stats.index
+                  else _global_mean_gd
+    ).values.astype(np.float32)
+    clean_train_df['gare_dow_enc'] = _enc_gd
+
+# Daily delay environment: mean p2q0 per date across all trips.
+# Captures systemic delay conditions that day — available for both train and test rows.
+# Seasonally agnostic: reflects actual delay level, not a calendar-based seasonal proxy.
+if 'p2q0' in clean_train_df.columns and 'date' in clean_train_df.columns:
+    _daily_p2q0 = clean_train_df.groupby('date')['p2q0'].mean().astype(np.float32)
+    clean_train_df['daily_p2q0_mean'] = clean_train_df['date'].map(_daily_p2q0).astype(np.float32)
+
+# Per-station upstream delay statistics: mean and std of p2q0, p3q0, p4q0 per gare.
+# Captures structural upstream delay characteristics of each station — stable across timetable changes.
+# Orthogonal to gare_delay_enc (which encodes p0q0, the target) and flow features (graph-edge-based).
+if 'gare_cat' in clean_train_df.columns:
+    for _col in ['p2q0', 'p3q0', 'p4q0', 'p0q2', 'p0q3', 'p0q4']:
+        if _col in clean_train_df.columns:
+            _stats = clean_train_df.groupby('gare_cat')[_col].agg(['mean', 'std']).astype(np.float32)
+            clean_train_df[f'gare_{_col}_mean'] = clean_train_df['gare_cat'].map(_stats['mean']).astype(np.float32)
+            clean_train_df[f'gare_{_col}_std']  = clean_train_df['gare_cat'].map(_stats['std']).astype(np.float32)
+
+# Per-(gare, day_of_week) mean of p2q0 — Mon-Fri station-specific upstream delay patterns.
+if all(c in clean_train_df.columns for c in ['gare_cat', 'day_of_week', 'p2q0']):
+    clean_train_df['gare_dow_p2q0_mean'] = (
+        clean_train_df.groupby(['gare_cat', 'day_of_week'])['p2q0']
+        .transform('mean').astype(np.float32)
+    )
+
 # --- 4. Model Definitions ---
 def train_rf_best_params(df, features, target, test_size=0.2, random_state=42):
     X = df[features].values
@@ -601,7 +660,11 @@ NN_SCALE_COLS = [
     'arret', 'day_of_year', 'month',
     'p2q0', 'p3q0', 'p4q0', 'p0q2', 'p0q3', 'p0q4',
     'gare_in_count', 'gare_out_count', 'gare_in_mean_delay', 'gare_out_mean_delay',
-    'gare_delay_enc', 'train_delay_enc',
+    'gare_delay_enc', 'train_delay_enc', 'gare_dow_enc', 'gare_dow_p2q0_mean', 'daily_p2q0_mean',
+    'gare_p2q0_mean', 'gare_p2q0_std',
+    'gare_p3q0_mean', 'gare_p3q0_std', 'gare_p4q0_mean', 'gare_p4q0_std',
+    'gare_p0q2_mean', 'gare_p0q2_std',
+    'gare_p0q3_mean', 'gare_p0q3_std', 'gare_p0q4_mean', 'gare_p0q4_std',
     *[f'flowavg{d}' for d in range(1, 9)],
     'dow_sin', 'dow_cos', 'doy_sin', 'doy_cos',
 ]
@@ -791,13 +854,13 @@ def train_nn_full_predict(train_df, test_df, features, target, scale_cols=NN_SCA
 _LGBM_PARAMS = {
     'objective':         'regression_l1',
     'metric':            'mae',
-    'num_leaves':        127,        # was 255 — fewer leaves reduce overfit to training gare/arret patterns
+    'num_leaves':        127,
     'learning_rate':     0.02,
-    'min_child_samples': 40,         # was 10 — require 4× more data per leaf
+    'min_child_samples': 40,
     'subsample':         0.85,
-    'colsample_bytree':  0.85,
+    'colsample_bytree':  0.90,
     'reg_alpha':         0.1,
-    'reg_lambda':        3.0,        # was 1.0 — stronger L2
+    'reg_lambda':        3.0,
     'verbose':           -1,
 }
 
@@ -844,11 +907,11 @@ def train_lgbm_oof_predict(train_df, test_df, features, target='p0q0',
         dval   = lgb.Dataset(X_all.iloc[val_idx], label=y_all[val_idx], reference=dtrain)
         booster = lgb.train(
             params, dtrain,
-            num_boost_round=3000,
+            num_boost_round=5000,
             valid_sets=[dval],
             callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)],
         )
-        oof_preds[val_idx]      = booster.predict(X_all.iloc[val_idx]).astype(np.float32)
+        oof_preds[val_idx]       = booster.predict(X_all.iloc[val_idx]).astype(np.float32)
         test_preds_folds[fold-1] = booster.predict(test_df[features]).astype(np.float32)
         fold_mae = mean_absolute_error(y_all[val_idx], oof_preds[val_idx])
         print(f"  [LGBM fold {fold}/{n_splits}] MAE={fold_mae:.4f}  best_iter={booster.best_iteration}")
@@ -857,7 +920,18 @@ def train_lgbm_oof_predict(train_df, test_df, features, target='p0q0',
     test_preds = test_preds_folds.mean(axis=0)
     print(f"  [LGBM OOF] MAE={oof_mae:.4f}  (test preds bagged across {n_splits} folds)")
 
-    return oof_preds, test_preds, oof_mae
+    # Temporal OOF: MAE on the most recent 20% of training dates — proxy for website performance.
+    # Test set comes from a later time period, so this metric better reflects generalisation.
+    _dates = train_df['date'].values
+    _date_thresh = np.percentile(_dates, 80)
+    _recent_mask = _dates >= _date_thresh
+    temporal_oof_mae = float('nan')
+    if _recent_mask.sum() > 0:
+        temporal_oof_mae = mean_absolute_error(y_all[_recent_mask], oof_preds[_recent_mask])
+        print(f"  [LGBM temporal OOF] MAE on most recent 20% of dates: {temporal_oof_mae:.4f}"
+              f"  ({_recent_mask.sum()} rows, date >= {_date_thresh})")
+
+    return oof_preds, test_preds, oof_mae, temporal_oof_mae
 
 
 def train_catboost_oof_predict(train_df, test_df, features, target='p0q0',
@@ -982,35 +1056,17 @@ print(f"\nFeatures: {len(features)} total | flow={n_flow} gare_ohe={len(_gare_oh
 
 audit_feature_importance(X_train_df, features, target='p0q0', sample_frac=0.30)
 
-# 3-model ensemble: LGBM + CatBoost + NN (gare Embedding)
-# LGBM/CatBoost: gare_delay_enc (LOO) + gare_cat (CatBoost treats as categorical) + graph + numeric
-# NN: gare_delay_enc + graph + numeric (no OHE), gare_cat goes to learned Embedding separately
-# LGBM and CB weights are set analytically via OOF optimisation (see below); NN weight is fixed.
-NN_WEIGHT = 0.10  # fixed: NN has only 10% val coverage, excluded from OOF optimisation
+# 2-model ensemble: LGBM + NN (gare Embedding)
+# CatBoost dropped: OOF optimiser gave it weight=0.000 in I-13 and I-14 — no orthogonal signal.
+LGBM_WEIGHT = 0.85
+NN_WEIGHT   = 0.15
 
 print('\n--- [LGBM] GroupKFold OOF (5 folds) + bagged test predictions ---')
-lgbm_oof, lgbm_test_preds, lgbm_oof_mae = train_lgbm_oof_predict(
+print(f"  Training date range: {X_train_df['date'].min()} to {X_train_df['date'].max()}")
+print(f"  Test date range:     {X_test_df['date'].min()} to {X_test_df['date'].max()}")
+lgbm_oof, lgbm_test_preds, lgbm_oof_mae, lgbm_temporal_mae = train_lgbm_oof_predict(
     X_train_df, X_test_df, features, target='p0q0')
-print(f"  LGBM OOF MAE: {lgbm_oof_mae:.4f}")
-
-print('\n--- [CatBoost] GroupKFold OOF (5 folds) + bagged test predictions ---')
-catboost_oof, catboost_test_preds, catboost_oof_mae = train_catboost_oof_predict(
-    X_train_df, X_test_df, features, target='p0q0')
-print(f"  CatBoost OOF MAE: {catboost_oof_mae:.4f}")
-
-# Analytical optimisation: find the LGBM/(LGBM+CB) split that minimises OOF MAE.
-# Both models have full 667k-row OOF coverage so this is unbiased.
-_y_oof = X_train_df['p0q0'].values.astype(np.float32)
-_opt = minimize_scalar(
-    lambda w: mean_absolute_error(_y_oof, w * lgbm_oof + (1 - w) * catboost_oof),
-    bounds=(0.0, 1.0), method='bounded',
-)
-_w_lgbm     = float(_opt.x)
-LGBM_WEIGHT     = _w_lgbm * (1 - NN_WEIGHT)
-CATBOOST_WEIGHT = (1 - _w_lgbm) * (1 - NN_WEIGHT)
-print(f"\n  OOF optimal LGBM/(LGBM+CB): {_w_lgbm:.4f} "
-      f"→ LGBM={LGBM_WEIGHT:.3f} CB={CATBOOST_WEIGHT:.3f} NN={NN_WEIGHT:.3f} "
-      f"(OOF blend MAE={_opt.fun:.4f})")
+print(f"  LGBM OOF MAE: {lgbm_oof_mae:.4f}  |  Temporal OOF MAE: {lgbm_temporal_mae:.4f}")
 
 print('\n--- [NN] Training on numeric features + gare Embedding ---')
 nn_test_preds, nn_val_mae = train_nn_full_predict(
@@ -1018,11 +1074,10 @@ nn_test_preds, nn_val_mae = train_nn_full_predict(
     gare_cat_col='gare_cat', n_gare=N_GARE)
 print(f"  NN val MAE: {nn_val_mae:.4f}")
 
-test_predictions = (LGBM_WEIGHT     * lgbm_test_preds
-                    + CATBOOST_WEIGHT * catboost_test_preds
-                    + NN_WEIGHT       * nn_test_preds)
-print(f"\n  Ensemble (LGBM×{LGBM_WEIGHT:.3f} + CB×{CATBOOST_WEIGHT:.3f} + NN×{NN_WEIGHT:.3f}): "
-      f"LGBM={lgbm_oof_mae:.4f} | CB={catboost_oof_mae:.4f} | NN={nn_val_mae:.4f}")
+test_predictions = (LGBM_WEIGHT * lgbm_test_preds
+                    + NN_WEIGHT  * nn_test_preds)
+print(f"\n  Ensemble (LGBM×{LGBM_WEIGHT:.3f} + NN×{NN_WEIGHT:.3f}): "
+      f"LGBM={lgbm_oof_mae:.4f} | NN={nn_val_mae:.4f}")
 
 submission_df = pd.DataFrame({
     'row_id': x_test['x_test_row_id'].values,

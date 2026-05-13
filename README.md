@@ -8,59 +8,66 @@ The challenge focuses on predicting the waiting time difference (**p0q0**) for a
 * **Negative values**: Indicate delays (longer waiting times than scheduled).
 * **Positive values**: Indicate arrivals ahead of schedule.
 
-**Current Performance (I-19)**: Website leaderboard MAE = **0.6719** (achieved with `gare_dow_enc` LOO encoding). Local metrics via 5-fold GroupKFold and time-holdout validation confirm stability across train/test distributions.
+**Current Performance (I-36)**: Website leaderboard MAE = **0.6700** — best so far. Ensemble LGBM×0.85 + NN×0.15. Local metrics: GroupKFold OOF 0.6397, temporal OOF 0.6318.
 
 ## Technical Architecture
 
 The pipeline implements a sophisticated multi-model approach designed to minimize Mean Absolute Error (MAE) while ensuring robustness against distribution shifts.
 
 ### Feature Engineering
-The current feature set consists of **111+ total variables** structured into specialized groups:
-* **Flow Features (8)**: Real-time traffic density and network load (`flowavg1` – `flowavg8`).
-* **Graph-based Features (88)**: Topological relationships and connectivity between stations (cycle-aware graph metrics).
-* **Categorical Encodings**:
-  - **Gare (Station) Embedding**: Categorical station identifier (84 unique gares) encoded as learned Embedding(84, 16) in the NN (replaces one-hot encoding). LightGBM receives ordinal encoding.
-  - **Leave-One-Out (LOO) Target Encodings**: High-cardinality features capture historical signal without leakage. Currently active:
-    - `gare_delay_enc`: Mean delay per station, grouped by 5-fold CV
-    - `train_delay_enc`: Mean delay per train number
-    - `gare_dow_enc`: Mean delay per station-day-of-week pair (low-cardinality, 420 combinations; accepted in I-19)
-    - All computed within GroupKFold to prevent train/test contamination.
-* **Temporal & Contextual**: Day of week, time of day, and other cyclical features.
+The current feature set contains **43 active variables** across 7 groups:
+* **Upstream delay (6)**: `p2q0`, `p3q0`, `p4q0`, `p0q2`, `p0q3`, `p0q4` — raw delay signals from neighboring stops.
+* **Flow Features (8)**: `flowavg1`–`flowavg8` — real-time traffic density and network load.
+* **Graph features (5)**: `gare_in_count`, `gare_out_count`, `gare_in_mean_delay`, `gare_out_mean_delay`, `gare_cat` — topological relationships and connectivity (cycle-aware DiGraph).
+* **Per-station statistics (12)**: Mean and std of each upstream/downstream delay signal grouped by station — added in I-30→I-34:
+  - Upstream: `gare_p2q0_mean/std`, `gare_p3q0_mean/std`, `gare_p4q0_mean/std`
+  - Downstream: `gare_p0q2_mean/std`, `gare_p0q3_mean/std`, `gare_p0q4_mean/std`
+* **LOO Target Encodings (3)**: Computed within GroupKFold to prevent leakage:
+  - `gare_delay_enc`: Mean target delay per station
+  - `train_delay_enc`: Mean target delay per train number
+  - `gare_dow_enc`: Mean target delay per (station, day-of-week) pair — 420 low-cardinality combinations (I-19)
+* **Stop position (1)**: `arret`
+* **Temporal (8)**: `day_of_week`, `day_of_year`, `month`, `doy_sin`, `doy_cos`, `dow_sin`, `dow_cos` + cyclical encoding.
 
 ### Model Strategy
 The system utilizes a **weighted ensemble** optimized for MAE minimization:
-1. **LightGBM (90% weight)**: Tuned boosting model with 5-fold GroupKFold OOF for training rows and bagged test predictions. Hyperparameters: `num_leaves=127`, `min_child_samples=40`, `reg_lambda=3.0`, `learning_rate=0.02`. Achieves LGBM OOF MAE ≈ 0.640.
-2. **Neural Network (10% weight)**: Keras residual MLP with dual inputs: (a) learned `gare` Embedding(N_GARE=84, 16) for categorical station context, and (b) numeric features. NN validation MAE ≈ 0.673. Designed for residual correction and capturing smooth, non-linear temporal patterns.
-3. **Ensemble Blend**: Simple weighted average at inference. CatBoost was previously included but dropped after I-15 (weight optimisation converged to 0.000, indicating LGBM captures all signal on the given feature set).
+1. **LightGBM (85% weight)**: 5-fold GroupKFold OOF for training rows, bagged test predictions. Hyperparameters: `num_leaves=127`, `min_child_samples=40`, `reg_lambda=3.0`, `learning_rate=0.02`, `colsample_bytree=0.90`, `num_boost_round=5000`. OOF MAE ≈ 0.640.
+2. **Neural Network (15% weight)**: Keras residual MLP, dual-input — `gare` Embedding(84, 16) + numeric features. NN val MAE ≈ 0.677. Weight increased from 10% to 15% in I-36 after ensemble tuning confirmed added value.
+3. **Ensemble Blend**: Simple weighted average. CatBoost was dropped in I-15 (OOF weight collapsed to 0.000 for two consecutive iterations).
 
 ## Feature Selection & Importance
 
-An `audit_feature_importance` function runs at every iteration — LGBM gain + `mutual_info_regression` on a 30% sample — and prints a combined KEEP/DEAD verdict table before training. All 31 current features pass the audit.
+An `audit_feature_importance` function runs at every iteration — LGBM gain + `mutual_info_regression` on a 30% sample — and prints a KEEP/DEAD verdict before training. **All 43 current features pass the audit.**
 
-### Ranked by LGBM Gain (31 features, all KEEP)
+### Active Features (43 total, all KEEP — state at I-36)
 
-| Rank | Feature | LGBM Gain | Mutual Info | Group |
-|------|---------|-----------|-------------|-------|
-| 1 | `gare_month_enc` | 512 277 | 0.277 | LOO Encoding |
-| 2 | `gare_delay_enc` | 322 334 | 0.243 | LOO Encoding |
-| 3 | `p2q0` | 274 516 | 0.059 | Upstream delay |
-| 4 | `arret` | 247 936 | 0.034 | Stop position |
-| 5 | `gare_in_count` | 190 729 | 0.243 | Graph |
-| 6 | `p3q0` | 110 944 | 0.011 | Upstream delay |
-| 7 | `p4q0` | 110 845 | 0.023 | Upstream delay |
-| 8 | `doy_cos` | 78 592 | 0.009 | Temporal |
-| 9 | `gare_in_mean_delay` | 54 438 | 0.244 | Graph |
-| 10 | `gare_out_mean_delay` | 38 968 | 0.237 | Graph |
-| 11 | `gare_cat` | 38 535 | 0.241 | Categorical |
-| 12–19 | `flowavg2–5`, `gare_out_count`, `p0q2`, `p0q4`, `day_of_year` | 7k–36k | 0.09–0.24 | Flow / Upstream |
-| 20 | `gare_dow_enc` | 14 623 | 0.240 | LOO Encoding |
-| 21–31 | `p0q3`, `doy_sin`, `flowavg6–8`, `flowavg1`, `day_of_week`, `month`, `dow_sin`, `dow_cos`, `train_delay_enc` | 0–7k | 0.00–0.07 | Mixed |
+| Group | Features | Count | Notes |
+|-------|----------|-------|-------|
+| Per-station stats (upstream) | `gare_p0q2_mean/std`, `gare_p0q3_mean/std`, `gare_p0q4_mean/std`, `gare_p2q0_mean/std`, `gare_p3q0_mean/std`, `gare_p4q0_mean/std` | 12 | Top LGBM gain features; `gare_p0q4_mean` ranked #1 (I-34) |
+| Upstream/downstream delay (raw) | `p2q0`, `p3q0`, `p4q0`, `p0q2`, `p0q3`, `p0q4` | 6 | Strong LGBM signal |
+| Flow | `flowavg1`–`flowavg8` | 8 | `flowavg1` has 0 LGBM gain but retained (MI signal via NN) |
+| Graph | `gare_in_count`, `gare_out_count`, `gare_in_mean_delay`, `gare_out_mean_delay` | 4 | High mutual info (~0.24) |
+| LOO encodings | `gare_delay_enc`, `train_delay_enc`, `gare_dow_enc` | 3 | GroupKFold-safe; time-stable keys only |
+| Categorical | `gare_cat` | 1 | Ordinal for LGBM; Embedding(84,16) for NN |
+| Stop position | `arret` | 1 | |
+| Temporal | `day_of_week`, `day_of_year`, `month`, `doy_sin`, `doy_cos`, `dow_sin`, `dow_cos` | 7 | `month`/`dow_sin/cos` have 0 LGBM gain but retained |
+| Stop position | `arret` | 1 | |
 
-**Key observations:**
-- LOO encodings (`gare_month_enc`, `gare_delay_enc`) dominate LGBM gain, confirming station-level historical signal is the strongest predictor.
-- Graph features (`gare_in_count`, `gare_in/out_mean_delay`) show high mutual information (~0.24), suggesting they capture structural delay propagation well.
-- `flowavg1`, `month`, `dow_sin/cos`, `train_delay_enc` have zero LGBM gain but are retained — mutual information confirms they carry latent signal not captured by gain alone.
-- No features were marked DEAD in the current configuration.
+### Rejected Features (do not re-add)
+
+| Feature | Iteration | Reason |
+|---------|-----------|--------|
+| `is_weekend` | I-14 | Constant feature — dataset contains no weekend days |
+| `arret_delay_enc` | I-15, I-25 | High cardinality; arret distribution shifts between train/test |
+| `train_gare_enc` | I-15 | Train ID distribution structurally different in test set |
+| `gare_month_enc` | I-21 | Month is time-period key — LOO values don't transfer to test period |
+| `train_dow_enc` | I-20 | Train-based LOO — train IDs shift between train/test |
+| `arret_p2q0_mean/std` | I-35 | Heavy LGBM adoption locally but hurt OOD generalization (timetable change) |
+
+**Rules derived from rejections:**
+- Never use `train` as a component in LOO encodings (train ID distribution shifts)
+- Never use time-period keys (`month`, `day_of_year`) in LOO encodings (temporal shift)
+- Features with 0 LGBM gain are NOT safe to prune — they carry signal via the NN (confirmed in I-29)
 
 ## Data Consistency and Validation
 
@@ -68,16 +75,19 @@ The pipeline enforces strict alignment between local validation and leaderboard 
 * **GroupKFold Cross-Validation**: 5-fold stratification by train/route groups ensures temporal and operational consistency. LGBM OOF MAE ≈ 0.640; reported as single source-of-truth for feature engineering decisions.
 * **Time-Holdout Validation**: Chronological split to detect covariate shift and verify that features generalize across unseen time periods.
 * **Distribution Audit**: Adversarial validation identifies features with significant train/test drift. Features flagged for removal if drift exceeds threshold (e.g., `is_weekend` was a constant — removed in I-14).
-* **Leaderboard Alignment**: Website MAE 0.6719 vs. local GroupKFold OOF ~0.643 = 0.028 gap, indicating healthy generalization with no serious distribution mismatch.
+* **Leaderboard Alignment**: Website MAE 0.6700 vs. GroupKFold OOF 0.6397 / temporal OOF 0.6318 — gap ≈ 0.030, stable across iterations.
 
 ## Recent Improvements (Iteration Log)
 
 See `SKILL.md` for detailed iteration history and ablation studies. Key recent wins:
 
-* **I-19 (2026-05-07) ★ CURRENT BEST**: Added `gare_dow_enc` — LOO encoding for (gare, day-of-week) pairs. Cardinality: 84×5=420 well-covered combinations. Website **0.6719** (improvement −0.0005 vs I-14 baseline 0.6724). ✅ ACCEPTED.
-* **I-20 (2026-05-07)**: Attempted `gare_month_enc + train_dow_enc`. Website **0.7108** — catastrophic regression. ❌ REJECTED. Confirmed: `train`-based LOO encodings fail due to structurally different train ID distribution in test set.
-* **I-14 (2026-05-05)**: Removed `is_weekend` constant feature and audited feature importance. Achieved **0.6724 MAE** (non-regression baseline).
-* **I-13 (2026-05-05)**: OOF weight optimisation via `scipy.optimize.minimize_scalar` revealed CatBoost weight=0.000. Introduced `train_delay_enc` LOO encoding. Effective ensemble: **LGBM×0.90 + NN×0.10**.
+* **I-36 (2026-05-13) ★ CURRENT BEST**: `colsample_bytree` 0.85→0.90; ensemble rebalanced LGBM×0.85 + NN×0.15. Website **0.6700** (−0.0002). ✅ ACCEPTED.
+* **I-34 (2026-05-12)**: Added `gare_p0q3_mean/std`, `gare_p0q4_mean/std` downstream per-station stats. Website **0.6702** (−0.0004). ✅ ACCEPTED.
+* **I-33 (2026-05-12)**: Added `gare_p0q2_mean/std`. `gare_p0q2_mean` became #1 LGBM gain feature (586k). Website **0.6706**. ✅ ACCEPTED.
+* **I-32 (2026-05-10)**: Added `gare_p3q0/p4q0_mean/std` per-station upstream stats. Website **0.6703**. ✅ ACCEPTED.
+* **I-31 (2026-05-10)**: Increased `num_boost_round` 3000→5000 (folds were hitting ceiling). Website **0.6706**. ✅ ACCEPTED.
+* **I-30 (2026-05-10)**: Added `gare_p2q0_mean/std`. Website **0.6707**. ✅ ACCEPTED.
+* **I-19 (2026-05-07)**: Added `gare_dow_enc` LOO for (gare, day-of-week). Website **0.6719**. ✅ ACCEPTED.
 
 ## Requirements
 
